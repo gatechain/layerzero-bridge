@@ -3,7 +3,7 @@
 
 export type RegistryChainKey = 'gate-testnet' | 'sepolia'
 
-export type RegistryTokenKey = 'USDT'
+export type RegistryTokenKey = 'USDT' | 'USDC' | 'WETH' | 'ETH'
 
 export type TokenKind = 'OFT' | 'OFT_ADAPTER'
 
@@ -55,7 +55,7 @@ export const REGISTRY = {
       "symbol": "ETH",
       "decimals": 18
     },
-    "rpcUrl": "https://eth-sepolia.g.alchemy.com/v2/rfdRP2gPYwl28VMWGwyA480qNKpB0h2f",
+    "rpcUrl": "https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY",
     "explorerUrl": "https://sepolia.etherscan.io"
   }
 },
@@ -73,6 +73,38 @@ export const REGISTRY = {
       "sepolia": {
         "token": "0x49f107cDD2C0FD3a03b9613633716fB240374a6e",
         "adapter": "0xe0EF48F595349B89F2bBF9185A4f5A7855567338"
+      }
+    }
+  },
+  "USDC": {
+    "key": "USDC",
+    "symbol": "USDC",
+    "decimals": 6,
+    "kind": "OFT_ADAPTER",
+    "perChain": {
+      "gate-testnet": {
+        "token": "0x80e8274Cf957c3875053327f1AB97aF569106232",
+        "adapter": "0x1dD9eBB50eC3aF04eda6C2f902A8Aae13dA190AF"
+      },
+      "sepolia": {
+        "token": "0xaf10e7b9F095BC764C015B3CcDE0DE4CA6256Ed8",
+        "adapter": "0x69920BE9aC7d222bcFA4F56E2C3D643421c065eb"
+      }
+    }
+  },
+  "ETH": {
+    "key": "ETH",
+    "symbol": "ETH",
+    "decimals": 18,
+    "kind": "OFT",
+    "perChain": {
+      "gate-testnet": {
+        "token": "0xDEe1688F077240B02f1cE85e1aE57aAf33631E4a",
+        "adapter": "0xDEe1688F077240B02f1cE85e1aE57aAf33631E4a"
+      },
+      "sepolia": {
+        "token": "0x0000000000000000000000000000000000000000",
+        "adapter": "0x16a531FCaB32d7ffF4554eaa7E0850998641d8C6"
       }
     }
   }

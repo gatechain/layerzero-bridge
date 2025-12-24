@@ -1,7 +1,7 @@
 import './App.css'
 
 import { ConnectButton } from '@rainbow-me/rainbowkit'
-import { useAccount, useBalance, useChainId, useReadContract, useSwitchChain, useWalletClient } from 'wagmi'
+import { useAccount, useBalance, useChainId, useReadContract, useSwitchChain, useWalletClient, useWriteContract } from 'wagmi'
 import { parseUnits, formatUnits } from 'viem'
 import type { Address, Hex } from 'viem'
 import { useMemo, useState } from 'react'
@@ -21,9 +21,11 @@ import {
     type RegistryTokenKey,
 } from './constants/layerzero'
 import { erc20Abi } from './abi/erc20'
+import { usdtOftAdapterAbi } from './abi/usdtOftAdapter'
 import { addressToBytes32 } from './utils/addressToBytes32'
 
 const INTENTS_SERVER_BASE_URL = 'http://127.0.0.1:8082'
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address
 
 type PermitTypedDataApiResponse = {
     code: number
@@ -71,6 +73,7 @@ function App() {
     const { address, isConnected } = useAccount()
     const chainId = useChainId()
     const { switchChainAsync } = useSwitchChain()
+    const { writeContractAsync } = useWriteContract()
 
     const chainOptions = useMemo(() => listChains(), [])
     const tokenOptions = useMemo(() => listTokens(), [])
@@ -135,6 +138,7 @@ function App() {
     // ----- Source reads
     const srcToken = srcContracts.token
     const srcAdapter = srcContracts.adapter
+    const isNativeTokenOnSource = srcToken.toLowerCase() === ZERO_ADDRESS
 
     const { data: gateBalance } = useReadContract({
         abi: erc20Abi,
@@ -142,7 +146,7 @@ function App() {
         functionName: 'balanceOf',
         args: address ? [address] : undefined,
         chainId: srcChainId,
-        query: { enabled: !!address },
+        query: { enabled: !!address && !isNativeTokenOnSource },
     })
 
     const { data: gateNativeBal } = useBalance({
@@ -174,6 +178,17 @@ function App() {
     })
 
     const hasDestLiquidity = (sepoliaAdapterBal ?? 0n) > 0n
+    const requiresDestLiquidity = dstAdapter.toLowerCase() !== dstToken.toLowerCase()
+    const hasEnoughDestLiquidity = !requiresDestLiquidity || hasDestLiquidity
+
+    const { refetch: refetchQuoteSend, isFetching: isQuoting } = useReadContract({
+        abi: usdtOftAdapterAbi,
+        address: srcAdapter,
+        functionName: 'quoteSend',
+        args: sendParam ? [sendParam, false] : undefined,
+        chainId: srcChainId,
+        query: { enabled: false },
+    })
 
     async function ensureOnSourceChain() {
         if (chainId !== srcChainId) {
@@ -302,13 +317,81 @@ function App() {
         }
     }
 
+    async function onSendNative() {
+        // Native token send: call adapter.send() directly from wallet (no permit).
+        if (!address || !recipient || !sendParam || !amountLD) return
+        await ensureOnSourceChain()
+        setLastSignError(null)
+        setLastSignedTxHash(null)
+        setLastTaskId(null)
+
+        try {
+            if (!walletClient) {
+                setLastSignError('Missing wallet client (connect wallet and switch to source chain)')
+                return
+            }
+
+            const quoted = await refetchQuoteSend()
+            const msgFee = quoted.data
+            if (!msgFee) throw new Error('Failed to quoteSend()')
+
+            const fee = {
+                nativeFee: msgFee.nativeFee,
+                lzTokenFee: msgFee.lzTokenFee,
+            } as const
+            setNativeFee(fee.nativeFee)
+
+            // NativeOFTAdapter requires msg.value == nativeFee + amountLD (dust-removed)
+            const requiredValue = fee.nativeFee + amountLD
+
+            const bal = gateNativeBal?.value
+            if (bal != null && bal <= requiredValue) {
+                throw new Error(
+                    `Insufficient ${getChainMeta(srcChainKey).nativeCurrency.symbol}: need amount+nativeFee (${formatUnits(requiredValue, 18)}), have (${formatUnits(bal, 18)})`
+                )
+            }
+
+            const txHash = await writeContractAsync({
+                abi: usdtOftAdapterAbi,
+                address: srcAdapter,
+                functionName: 'send',
+                args: [sendParam, fee, address],
+                value: requiredValue,
+                chainId: srcChainId,
+            })
+            setLastSignedTxHash(txHash)
+
+            // Track via backend (optional but recommended for lz_guid + dst completion)
+            const submitResp = await fetch(`${INTENTS_SERVER_BASE_URL}/api/v0/bridge/tx/submit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_address: address,
+                    tx_type: 'bridge',
+                    source_chain_key: srcChainKey,
+                    token_key: tokenKey,
+                    dest_chain_key: dstChainKey,
+                    tx_hash: txHash,
+                }),
+            })
+            const submitJson = (await submitResp.json()) as unknown as { code: number; message: string; reason?: string; data?: { task_id: string } }
+            if (submitResp.ok && submitJson.code === 0 && submitJson.data?.task_id) {
+                setLastTaskId(submitJson.data.task_id)
+            }
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            setLastSignError(msg)
+        }
+    }
+
     const canPayNativeFee = useMemo(() => {
         if (nativeFee == null) return true // unknown/not quoted yet
         const bal = gateNativeBal?.value
         if (bal == null) return true // unknown; let wallet decide
-        // Need msg.value + gas, so require strictly more than nativeFee
-        return bal > nativeFee
-    }, [gateNativeBal?.value, nativeFee])
+        // For native token send, msg.value includes amount + nativeFee.
+        const required = isNativeTokenOnSource && amountLD != null ? nativeFee + amountLD : nativeFee
+        return bal > required
+    }, [gateNativeBal?.value, nativeFee, isNativeTokenOnSource, amountLD])
 
   return (
         <div style={{ maxWidth: 920, margin: '0 auto', padding: 24, textAlign: 'left' }}>
@@ -439,9 +522,15 @@ function App() {
       </div>
 
                 <div style={{ marginTop: 14, display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                    <button disabled={!address || !sendParam || !amountLD || !canPayNativeFee} onClick={onSendWithPermit}>
-                        Send with Permit (quote + sign + send)
-                    </button>
+                    {isNativeTokenOnSource ? (
+                        <button disabled={!address || !sendParam || !amountLD || !canPayNativeFee || isQuoting || !hasEnoughDestLiquidity} onClick={onSendNative}>
+                            Send native (quote + send)
+                        </button>
+                    ) : (
+                        <button disabled={!address || !sendParam || !amountLD || !canPayNativeFee || !hasEnoughDestLiquidity} onClick={onSendWithPermit}>
+                            Send with Permit (quote + sign + relay)
+                        </button>
+                    )}
                 </div>
 
                 <div style={{ marginTop: 10, opacity: 0.8 }}>
