@@ -10,7 +10,7 @@ export type { RegistryChainKey, RegistryTokenKey }
  * Runtime overrides (optional) – still compile-time bundled, but lets you override defaults locally.
  */
 function env(name: string): string | undefined {
-    const v = (import.meta as any).env?.[name]
+    const v = (import.meta as ImportMeta & { env?: Record<string, unknown> }).env?.[name]
     return typeof v === 'string' && v.length > 0 ? v : undefined
 }
 
@@ -85,22 +85,23 @@ export function getTokenDecimals(tokenKey: RegistryTokenKey): number {
 }
 
 export function getTokenContracts(tokenKey: RegistryTokenKey, chainKey: RegistryChainKey): { token: Address; adapter: Address } {
-    const per = REGISTRY.tokens[tokenKey].perChain[chainKey]
+    const perChain = REGISTRY.tokens[tokenKey].perChain as Partial<Record<RegistryChainKey, { token: string; adapter: string }>>
+    const per = perChain[chainKey]
     if (!per) {
         throw new Error(`Token ${tokenKey} not configured on chain ${chainKey}`)
     }
-    // optional overrides via env
-    if (tokenKey === 'USDT' && chainKey === 'gate-testnet') {
-        const token = (env('VITE_GATE_USDTMOCK') ?? per.token) as Address
-        const adapter = (env('VITE_GATE_USDTOFTADAPTER') ?? per.adapter) as Address
-        return { token, adapter }
-    }
-    if (tokenKey === 'USDT' && chainKey === 'sepolia') {
-        const token = (env('VITE_SEPOLIA_USDTMOCK') ?? per.token) as Address
-        const adapter = (env('VITE_SEPOLIA_USDTOFTADAPTER') ?? per.adapter) as Address
-        return { token, adapter }
-    }
-    return { token: per.token as Address, adapter: per.adapter as Address }
+
+    // Optional overrides via env (generic, supports USDT/USDC/...):
+    // - VITE_GATE_<TOKEN>MOCK, VITE_GATE_<TOKEN>OFTADAPTER
+    // - VITE_SEPOLIA_<TOKEN>MOCK, VITE_SEPOLIA_<TOKEN>OFTADAPTER
+    const chainPrefix = chainKey === 'gate-testnet' ? 'GATE' : chainKey.toUpperCase()
+    const tokenKeyUpper = String(tokenKey).toUpperCase()
+    const tokenEnvKey = `VITE_${chainPrefix}_${tokenKeyUpper}MOCK`
+    const adapterEnvKey = `VITE_${chainPrefix}_${tokenKeyUpper}OFTADAPTER`
+
+    const token = (env(tokenEnvKey) ?? per.token) as Address
+    const adapter = (env(adapterEnvKey) ?? per.adapter) as Address
+    return { token, adapter }
 }
 
 export const EXPLORER = {
