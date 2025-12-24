@@ -165,6 +165,73 @@ export const usdtOftAdapterAbi = [
             },
         ],
     },
+    {
+        type: 'function',
+        name: 'sendWithPermitFor',
+        stateMutability: 'payable',
+        inputs: [
+            { name: 'owner', type: 'address' },
+            {
+                name: '_sendParam',
+                type: 'tuple',
+                components: [
+                    { name: 'dstEid', type: 'uint32' },
+                    { name: 'to', type: 'bytes32' },
+                    { name: 'amountLD', type: 'uint256' },
+                    { name: 'minAmountLD', type: 'uint256' },
+                    { name: 'extraOptions', type: 'bytes' },
+                    { name: 'composeMsg', type: 'bytes' },
+                    { name: 'oftCmd', type: 'bytes' },
+                ],
+            },
+            {
+                name: '_fee',
+                type: 'tuple',
+                components: [
+                    { name: 'nativeFee', type: 'uint256' },
+                    { name: 'lzTokenFee', type: 'uint256' },
+                ],
+            },
+            { name: '_refundAddress', type: 'address' },
+            {
+                name: '_permit',
+                type: 'tuple',
+                components: [
+                    { name: 'value', type: 'uint256' },
+                    { name: 'deadline', type: 'uint256' },
+                    { name: 'v', type: 'uint8' },
+                    { name: 'r', type: 'bytes32' },
+                    { name: 's', type: 'bytes32' },
+                ],
+            },
+        ],
+        outputs: [
+            {
+                name: 'msgReceipt',
+                type: 'tuple',
+                components: [
+                    { name: 'guid', type: 'bytes32' },
+                    { name: 'nonce', type: 'uint64' },
+                    {
+                        name: 'fee',
+                        type: 'tuple',
+                        components: [
+                            { name: 'nativeFee', type: 'uint256' },
+                            { name: 'lzTokenFee', type: 'uint256' },
+                        ],
+                    },
+                ],
+            },
+            {
+                name: 'oftReceipt',
+                type: 'tuple',
+                components: [
+                    { name: 'amountSentLD', type: 'uint256' },
+                    { name: 'amountReceivedLD', type: 'uint256' },
+                ],
+            },
+        ],
+    },
 ] as const
 
 
