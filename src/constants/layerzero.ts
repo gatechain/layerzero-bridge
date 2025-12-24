@@ -2,66 +2,114 @@ import type { Address } from 'viem'
 import { defineChain } from 'viem'
 import { sepolia } from 'viem/chains'
 
+import { REGISTRY, type RegistryChainKey, type RegistryTokenKey } from './generated'
+
+export type { RegistryChainKey, RegistryTokenKey }
+
 /**
- * LayerZero Endpoint IDs (EIDs)
+ * Runtime overrides (optional) – still compile-time bundled, but lets you override defaults locally.
  */
-export const EID = {
-    GATE_V2_TESTNET: 40421,
-    SEPOLIA_V2_TESTNET: 40161,
-} as const
-
-export const TOKEN_DECIMALS = 6 as const
-
 function env(name: string): string | undefined {
     const v = (import.meta as any).env?.[name]
     return typeof v === 'string' && v.length > 0 ? v : undefined
 }
 
-export const RPC_URL = {
-    gate: env('VITE_GATE_RPC_URL') ?? 'https://gatelayer-testnet.gatenode.cc',
-    sepolia: env('VITE_SEPOLIA_RPC_URL') ?? sepolia.rpcUrls.default.http[0],
-} as const
+/**
+ * Resolve RPC URL for a registry chain key.
+ */
+export function getRpcUrl(chainKey: RegistryChainKey): string {
+    const override =
+        chainKey === 'gate-testnet'
+            ? env('VITE_GATE_RPC_URL')
+            : chainKey === 'sepolia'
+              ? env('VITE_SEPOLIA_RPC_URL')
+              : undefined
+
+    const fromRegistry = REGISTRY.chains[chainKey].rpcUrl
+
+    // If registry contains a placeholder (e.g. Alchemy "YOUR_KEY"), fall back to viem's default public RPC.
+    const fallback =
+        chainKey === 'sepolia' && fromRegistry.includes('rfdRP2gPYwl28VMWGwyA480qNKpB0h2f') ? sepolia.rpcUrls.default.http[0] : fromRegistry
+
+    return override ?? fallback
+}
 
 /**
- * GateLayer Testnet (custom chain)
- * - chainId (hex): 0x2767
- * - chainId (dec): 10087
+ * viem chain instances (static, since wagmi needs them at init)
  */
-export const gatelayerTestnet = defineChain({
-    id: 10087,
-    name: 'GateLayer Testnet',
-    nativeCurrency: { name: 'GATE', symbol: 'GATE', decimals: 18 },
-    rpcUrls: {
-        default: { http: [RPC_URL.gate] },
-        public: { http: [RPC_URL.gate] },
-    },
-    blockExplorers: {
-        // If you have a GateLayer testnet explorer URL, put it here
-        default: { name: 'Explorer', url: 'https://testnet.layerzeroscan.com' },
-    },
-})
-
-export const CHAINS = {
-    gate: gatelayerTestnet,
+export const VIEM_CHAINS: Record<RegistryChainKey, ReturnType<typeof defineChain> | typeof sepolia> = {
+    'gate-testnet': defineChain({
+        id: REGISTRY.chains['gate-testnet'].chainId,
+        name: REGISTRY.chains['gate-testnet'].name,
+        nativeCurrency: REGISTRY.chains['gate-testnet'].nativeCurrency,
+        rpcUrls: {
+            default: { http: [getRpcUrl('gate-testnet')] },
+            public: { http: [getRpcUrl('gate-testnet')] },
+        },
+        blockExplorers: {
+            default: {
+                name: 'Explorer',
+                url: REGISTRY.chains['gate-testnet'].explorerUrl || 'https://testnet.layerzeroscan.com',
+            },
+        },
+    }),
     sepolia,
-} as const
+}
 
-export const CONTRACTS = {
-    gate: {
-        usdtMock: (env('VITE_GATE_USDTMOCK') ?? '0xF8320A7822F70F8AC7a2bA8024FD91b5C1c8F84a') as Address,
-        usdtOftAdapter: (env('VITE_GATE_USDTOFTADAPTER') ??
-            '0x7E2bA79FA8bE30bE03f6FBCA3589075800Bbd92d') as Address,
-    },
-    sepolia: {
-        usdtMock: (env('VITE_SEPOLIA_USDTMOCK') ?? '0xFbd2Bea9f69d41A8505b52162D935FB7D52db345') as Address,
-        usdtOftAdapter: (env('VITE_SEPOLIA_USDTOFTADAPTER') ??
-            '0xF8320A7822F70F8AC7a2bA8024FD91b5C1c8F84a') as Address,
-    },
-} as const
+export const DEFAULT_SOURCE_CHAIN: RegistryChainKey = 'gate-testnet'
+export const DEFAULT_DEST_CHAIN: RegistryChainKey = 'sepolia'
+export const DEFAULT_TOKEN: RegistryTokenKey = 'USDT'
+
+export function listChains(): RegistryChainKey[] {
+    return Object.keys(REGISTRY.chains) as RegistryChainKey[]
+}
+
+export function listTokens(): RegistryTokenKey[] {
+    return Object.keys(REGISTRY.tokens) as RegistryTokenKey[]
+}
+
+export function getChainMeta(chainKey: RegistryChainKey) {
+    return REGISTRY.chains[chainKey]
+}
+
+export function getEid(chainKey: RegistryChainKey): number {
+    return REGISTRY.chains[chainKey].eid
+}
+
+export function getTokenMeta(tokenKey: RegistryTokenKey) {
+    return REGISTRY.tokens[tokenKey]
+}
+
+export function getTokenDecimals(tokenKey: RegistryTokenKey): number {
+    return REGISTRY.tokens[tokenKey].decimals
+}
+
+export function getTokenContracts(tokenKey: RegistryTokenKey, chainKey: RegistryChainKey): { token: Address; adapter: Address } {
+    const per = REGISTRY.tokens[tokenKey].perChain[chainKey]
+    if (!per) {
+        throw new Error(`Token ${tokenKey} not configured on chain ${chainKey}`)
+    }
+    // optional overrides via env
+    if (tokenKey === 'USDT' && chainKey === 'gate-testnet') {
+        const token = (env('VITE_GATE_USDTMOCK') ?? per.token) as Address
+        const adapter = (env('VITE_GATE_USDTOFTADAPTER') ?? per.adapter) as Address
+        return { token, adapter }
+    }
+    if (tokenKey === 'USDT' && chainKey === 'sepolia') {
+        const token = (env('VITE_SEPOLIA_USDTMOCK') ?? per.token) as Address
+        const adapter = (env('VITE_SEPOLIA_USDTOFTADAPTER') ?? per.adapter) as Address
+        return { token, adapter }
+    }
+    return { token: per.token as Address, adapter: per.adapter as Address }
+}
 
 export const EXPLORER = {
     layerzeroTx: (txHash: string) => `https://testnet.layerzeroscan.com/tx/${txHash}`,
-    sepoliaTx: (txHash: string) => `https://sepolia.etherscan.io/tx/${txHash}`,
+    tx: (chainKey: RegistryChainKey, txHash: string) => {
+        const base = REGISTRY.chains[chainKey].explorerUrl
+        if (!base) return undefined
+        return `${base.replace(/\/+$/, '')}/tx/${txHash}`
+    },
 } as const
 
 

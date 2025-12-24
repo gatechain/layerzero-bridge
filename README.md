@@ -11,6 +11,11 @@ It follows the same flow as `OFT_ADAPTER_GUIDE.md` in the repo:
 2. `adapter.quoteSend(sendParam)`
 3. `adapter.send(sendParam, fee, refundAddress)` with `value = nativeFee`
 
+## Docs
+
+- `docs/backend-quote-and-status.md`: how `src/App.tsx` constructs `sendParam`, calls `quoteSend/send`, and how to design backend APIs for quoting fees + polling `OFTReceived(guid, ...)` on the destination chain.
+- `docs/endpoint-address.md`: what `endpointAddress` means (LayerZero EndpointV2), where it is wired into `USDTOFTAdapter`, and why backends sometimes query endpoint events like `LzReceiveAlert`.
+
 ## Quick start
 
 ```bash
