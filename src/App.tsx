@@ -1,7 +1,7 @@
 import './App.css'
 
 import { ConnectButton } from '@rainbow-me/rainbowkit'
-import { useAccount, useBalance, useChainId, useReadContract, useSwitchChain, useWalletClient, useWriteContract } from 'wagmi'
+import { useAccount, useBalance, useChainId, useReadContract, useSwitchChain, useWalletClient } from 'wagmi'
 import { parseUnits, formatUnits } from 'viem'
 import type { Address, Hex } from 'viem'
 import { useMemo, useState } from 'react'
@@ -21,7 +21,6 @@ import {
     type RegistryTokenKey,
 } from './constants/layerzero'
 import { erc20Abi } from './abi/erc20'
-import { usdtOftAdapterAbi } from './abi/usdtOftAdapter'
 import { addressToBytes32 } from './utils/addressToBytes32'
 
 const INTENTS_SERVER_BASE_URL = 'http://127.0.0.1:8082'
@@ -72,7 +71,6 @@ function App() {
     const { address, isConnected } = useAccount()
     const chainId = useChainId()
     const { switchChainAsync } = useSwitchChain()
-    const { writeContractAsync } = useWriteContract()
 
     const chainOptions = useMemo(() => listChains(), [])
     const tokenOptions = useMemo(() => listTokens(), [])
@@ -85,6 +83,7 @@ function App() {
     const [amountHuman, setAmountHuman] = useState<string>('1.0')
     const [nativeFee, setNativeFee] = useState<bigint | null>(null)
     const [lastSignedTxHash, setLastSignedTxHash] = useState<string | null>(null)
+    const [lastTaskId, setLastTaskId] = useState<string | null>(null)
     const [lastSignError, setLastSignError] = useState<string | null>(null)
 
     const srcChain = VIEM_CHAINS[srcChainKey]
@@ -187,6 +186,7 @@ function App() {
         await ensureOnSourceChain()
         setLastSignError(null)
         setLastSignedTxHash(null)
+        setLastTaskId(null)
 
         try {
             if (!walletClient) {
@@ -263,33 +263,39 @@ function App() {
 
             const { v, r, s } = splitEcdsaSignature(signature)
 
-            // Keep sendParam consistent with backend amountLD (avoid decimals mismatch)
-            const sendParamSigned = {
-                dstEid: Number(data.resolved.send_param.dst_eid),
-                to: addressToBytes32(recipient) as Hex,
-                amountLD: BigInt(data.resolved.send_param.amount_ld),
-                minAmountLD: BigInt(data.resolved.send_param.min_amount_ld),
-                extraOptions: data.resolved.send_param.extra_options as Hex,
-                composeMsg: data.resolved.send_param.compose_msg as Hex,
-                oftCmd: data.resolved.send_param.oft_cmd as Hex,
-            } as const
-
-            // 3) Call adapter.sendWithPermit in a single on-chain tx
-            const txHash = await writeContractAsync({
-                abi: usdtOftAdapterAbi,
-                address: srcAdapter,
-                functionName: 'sendWithPermit',
-                args: [
-                    sendParamSigned,
-                    fee,
-                    address,
-                    { value: permitValue, deadline, v, r, s },
-                ],
-                value: fee.nativeFee,
-                chainId: srcChainId,
+            // 3) Send everything to backend relayer: backend pays gas + nativeFee and submits sendWithPermit
+            const relayResp = await fetch(`${INTENTS_SERVER_BASE_URL}/api/v0/bridge/tx/relay/send_with_permit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    src_chain_key: srcChainKey,
+                    dst_chain_key: dstChainKey,
+                    token_key: tokenKey,
+                    owner: address,
+                    to: recipient,
+                    amount_human: amountHuman,
+                    min_amount_human: amountHuman,
+                    pay_in_lz_token: false,
+                    permit: {
+                        value: permitValue.toString(),
+                        deadline: deadline.toString(),
+                        v,
+                        r,
+                        s,
+                    },
+                }),
             })
-
-            setLastSignedTxHash(txHash)
+            const relayJson = (await relayResp.json()) as unknown as {
+                code: number
+                message: string
+                reason?: string
+                data?: { task_id: string; tx_hash: string }
+            }
+            if (!relayResp.ok || relayJson.code !== 0 || !relayJson.data) {
+                throw new Error(relayJson.reason || relayJson.message || `Backend relay error (${relayResp.status})`)
+            }
+            setLastTaskId(relayJson.data.task_id)
+            setLastSignedTxHash(relayJson.data.tx_hash)
         } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
             setLastSignError(msg)
@@ -455,6 +461,11 @@ function App() {
                 {lastSignedTxHash && (
                     <div style={{ marginTop: 10 }}>
                         - Source tx hash: <code>{lastSignedTxHash}</code>
+                    </div>
+                )}
+                {lastTaskId && (
+                    <div style={{ marginTop: 10 }}>
+                        - Backend task id: <code>{lastTaskId}</code>
                     </div>
                 )}
 

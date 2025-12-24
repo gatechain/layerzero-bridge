@@ -68,11 +68,11 @@ export const REGISTRY = {
     "perChain": {
       "gate-testnet": {
         "token": "0xBdf0A1911f859cCC5DC70976bB0B19e37D4e27f6",
-        "adapter": "0x41f3796A955798A49D41Da733733b7953A8544a3"
+        "adapter": "0x032Dfe105C73f516b07aa95202733a3448e6B8Bc"
       },
       "sepolia": {
         "token": "0x49f107cDD2C0FD3a03b9613633716fB240374a6e",
-        "adapter": "0x41f3796A955798A49D41Da733733b7953A8544a3"
+        "adapter": "0xe0EF48F595349B89F2bBF9185A4f5A7855567338"
       }
     }
   }
