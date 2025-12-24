@@ -1,31 +1,109 @@
 import './App.css'
 
 import { ConnectButton } from '@rainbow-me/rainbowkit'
-import { useAccount, useBalance, useChainId, useReadContract, useSwitchChain, useWriteContract } from 'wagmi'
-import { readContract } from 'wagmi/actions'
+import { useAccount, useBalance, useChainId, useReadContract, useSwitchChain, useWalletClient, useWriteContract } from 'wagmi'
 import { parseUnits, formatUnits } from 'viem'
 import type { Address, Hex } from 'viem'
 import { useMemo, useState } from 'react'
 
-import { CONTRACTS, EID, EXPLORER, TOKEN_DECIMALS, CHAINS } from './constants/layerzero'
+import {
+    DEFAULT_DEST_CHAIN,
+    DEFAULT_SOURCE_CHAIN,
+    DEFAULT_TOKEN,
+    VIEM_CHAINS,
+    getChainMeta,
+    getEid,
+    getTokenContracts,
+    getTokenDecimals,
+    listChains,
+    listTokens,
+    type RegistryChainKey,
+    type RegistryTokenKey,
+} from './constants/layerzero'
 import { erc20Abi } from './abi/erc20'
 import { usdtOftAdapterAbi } from './abi/usdtOftAdapter'
 import { addressToBytes32 } from './utils/addressToBytes32'
-import { wagmiConfig } from './wagmi'
+
+const INTENTS_SERVER_BASE_URL = 'http://127.0.0.1:8082'
+
+type PermitTypedDataApiResponse = {
+    code: number
+    message: string
+    reason?: string
+    data?: {
+        fee: { native_fee_wei: string; lz_token_fee_wei: string }
+        resolved: {
+            send_param: {
+                dst_eid: number
+                amount_ld: string
+                min_amount_ld: string
+                extra_options: Hex
+                compose_msg: Hex
+                oft_cmd: Hex
+            }
+        }
+        permit: {
+            domain: {
+                name: string
+                version: string
+                verifying_contract: Address
+            }
+            message: {
+                spender: Address
+                value: string
+                nonce: string
+                deadline: string
+            }
+        }
+    }
+}
+
+function splitEcdsaSignature(sig: Hex): { v: number; r: Hex; s: Hex } {
+    // 65-byte signature: r (32) + s (32) + v (1)
+    if (!sig.startsWith('0x') || sig.length !== 132) throw new Error('Invalid signature hex')
+    const r = sig.slice(0, 66) as Hex
+    const s = (`0x${sig.slice(66, 130)}`) as Hex
+    const vRaw = Number.parseInt(sig.slice(130, 132), 16)
+    const v = vRaw < 27 ? vRaw + 27 : vRaw
+    return { v, r, s }
+}
 
 function App() {
-    const { address } = useAccount()
+    const { address, isConnected } = useAccount()
     const chainId = useChainId()
     const { switchChainAsync } = useSwitchChain()
     const { writeContractAsync } = useWriteContract()
 
+    const chainOptions = useMemo(() => listChains(), [])
+    const tokenOptions = useMemo(() => listTokens(), [])
+
+    const [srcChainKey, setSrcChainKey] = useState<RegistryChainKey>(DEFAULT_SOURCE_CHAIN)
+    const [dstChainKey, setDstChainKey] = useState<RegistryChainKey>(DEFAULT_DEST_CHAIN)
+    const [tokenKey, setTokenKey] = useState<RegistryTokenKey>(DEFAULT_TOKEN)
+
     const [to, setTo] = useState<string>('')
     const [amountHuman, setAmountHuman] = useState<string>('1.0')
     const [nativeFee, setNativeFee] = useState<bigint | null>(null)
-    const [lastSrcTx, setLastSrcTx] = useState<string | null>(null)
+    const [lastSignedTxHash, setLastSignedTxHash] = useState<string | null>(null)
+    const [lastSignError, setLastSignError] = useState<string | null>(null)
 
-    const gateChainId = CHAINS.gate.id
-    const sepoliaChainId = CHAINS.sepolia.id
+    const srcChain = VIEM_CHAINS[srcChainKey]
+    const dstChain = VIEM_CHAINS[dstChainKey]
+    const srcChainId: number = srcChain.id
+    const dstChainId: number = dstChain.id
+
+    // We intentionally broadcast approve/send via wallet (writeContractAsync).
+
+    const srcEid = getEid(srcChainKey)
+    const dstEid = getEid(dstChainKey)
+    const tokenDecimals = getTokenDecimals(tokenKey)
+    const srcContracts = getTokenContracts(tokenKey, srcChainKey)
+    const dstContracts = getTokenContracts(tokenKey, dstChainKey)
+
+    const { data: walletClient } = useWalletClient({
+        chainId: srcChainId,
+        query: { enabled: isConnected },
+    })
 
     const recipient: Address | null = useMemo(() => {
         const v = (to || address || '').trim()
@@ -35,16 +113,16 @@ function App() {
     const amountLD: bigint | null = useMemo(() => {
         try {
             if (!amountHuman) return null
-            return parseUnits(amountHuman, TOKEN_DECIMALS)
+            return parseUnits(amountHuman, tokenDecimals)
         } catch {
             return null
         }
-    }, [amountHuman])
+    }, [amountHuman, tokenDecimals])
 
     const sendParam = useMemo(() => {
         if (!recipient || !amountLD) return null
         return {
-            dstEid: EID.SEPOLIA_V2_TESTNET,
+            dstEid: dstEid,
             to: addressToBytes32(recipient) as Hex,
             amountLD,
             minAmountLD: amountLD,
@@ -53,160 +131,269 @@ function App() {
             composeMsg: '0x' as Hex,
             oftCmd: '0x' as Hex,
         } as const
-    }, [recipient, amountLD])
+    }, [recipient, amountLD, dstEid])
 
-    // ----- Gate reads (source)
-    const gateUsdt = CONTRACTS.gate.usdtMock
-    const gateAdapter = CONTRACTS.gate.usdtOftAdapter
+    // ----- Source reads
+    const srcToken = srcContracts.token
+    const srcAdapter = srcContracts.adapter
 
     const { data: gateBalance } = useReadContract({
         abi: erc20Abi,
-        address: gateUsdt,
+        address: srcToken,
         functionName: 'balanceOf',
         args: address ? [address] : undefined,
-        chainId: gateChainId,
-        query: { enabled: !!address },
-    })
-
-    const { data: gateAllowance } = useReadContract({
-        abi: erc20Abi,
-        address: gateUsdt,
-        functionName: 'allowance',
-        args: address ? [address, gateAdapter] : undefined,
-        chainId: gateChainId,
+        chainId: srcChainId,
         query: { enabled: !!address },
     })
 
     const { data: gateNativeBal } = useBalance({
         address,
-        chainId: gateChainId,
+        chainId: srcChainId,
         query: { enabled: !!address },
     })
 
-    // ----- Sepolia reads (destination)
-    const sepoliaUsdt = CONTRACTS.sepolia.usdtMock
-    const sepoliaAdapter = CONTRACTS.sepolia.usdtOftAdapter
+    // ----- Destination reads
+    const dstToken = dstContracts.token
+    const dstAdapter = dstContracts.adapter
 
     const { data: sepoliaRecipientBal } = useReadContract({
         abi: erc20Abi,
-        address: sepoliaUsdt,
+        address: dstToken,
         functionName: 'balanceOf',
         args: recipient ? [recipient] : undefined,
-        chainId: sepoliaChainId,
+        chainId: dstChainId,
         query: { enabled: !!recipient },
     })
 
     const { data: sepoliaAdapterBal } = useReadContract({
         abi: erc20Abi,
-        address: sepoliaUsdt,
+        address: dstToken,
         functionName: 'balanceOf',
-        args: [sepoliaAdapter],
-        chainId: sepoliaChainId,
+        args: [dstAdapter],
+        chainId: dstChainId,
         query: { enabled: true },
     })
 
     const hasDestLiquidity = (sepoliaAdapterBal ?? 0n) > 0n
 
-    async function ensureOnGate() {
-        if (chainId !== gateChainId) {
-            await switchChainAsync({ chainId: gateChainId })
+    async function ensureOnSourceChain() {
+        if (chainId !== srcChainId) {
+            await switchChainAsync({ chainId: srcChainId })
         }
     }
 
-    async function onApprove() {
-        if (!address || !amountLD) return
-        await ensureOnGate()
-        const txHash = await writeContractAsync({
-            abi: erc20Abi,
-            address: gateUsdt,
-            functionName: 'approve',
-            args: [gateAdapter, amountLD],
-        })
-        setLastSrcTx(txHash)
-    }
+    async function onSendWithPermit() {
+        if (!address || !recipient || !sendParam || !amountLD) return
+        await ensureOnSourceChain()
+        setLastSignError(null)
+        setLastSignedTxHash(null)
 
-    async function onQuote() {
-        if (!sendParam) return
-        await ensureOnGate()
-        const msgFee = (await readContract(wagmiConfig, {
-            abi: usdtOftAdapterAbi,
-            address: gateAdapter,
-            functionName: 'quoteSend',
-            args: [sendParam, false],
-            chainId: gateChainId,
-        })) as { nativeFee: bigint; lzTokenFee: bigint }
-        setNativeFee(msgFee.nativeFee)
-    }
+        try {
+            if (!walletClient) {
+                setLastSignError('Missing wallet client (connect wallet and switch to source chain)')
+                return
+            }
 
-    async function onSend() {
-        if (!address || !sendParam || nativeFee == null) return
-        await ensureOnGate()
-        const txHash = await writeContractAsync({
-            abi: usdtOftAdapterAbi,
-            address: gateAdapter,
-            functionName: 'send',
-            args: [sendParam, { nativeFee, lzTokenFee: 0n }, address],
-            value: nativeFee,
-        })
-        setLastSrcTx(txHash)
-        setNativeFee(null)
+            // 1) Quote + build Permit typed-data via backend
+            const resp = await fetch(`${INTENTS_SERVER_BASE_URL}/api/v0/bridge/permit/typed_data`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    src_chain_key: srcChainKey,
+                    dst_chain_key: dstChainKey,
+                    token_key: tokenKey,
+                    owner: address,
+                    to: recipient,
+                    amount_human: amountHuman,
+                    min_amount_human: amountHuman,
+                    pay_in_lz_token: false,
+                    permit_ttl_seconds: 3600,
+                }),
+            })
+            const json = (await resp.json()) as unknown as PermitTypedDataApiResponse
+            if (!resp.ok || json.code !== 0 || !json.data) {
+                throw new Error(json.reason || json.message || `Backend error (${resp.status})`)
+            }
+            const data = json.data
+
+            const fee = {
+                nativeFee: BigInt(data.fee.native_fee_wei),
+                lzTokenFee: BigInt(data.fee.lz_token_fee_wei),
+            } as const
+            setNativeFee(fee.nativeFee)
+
+            const bal = gateNativeBal?.value
+            if (bal != null && bal <= fee.nativeFee) {
+                throw new Error(
+                    `Insufficient ${getChainMeta(srcChainKey).nativeCurrency.symbol}: need nativeFee (${formatUnits(fee.nativeFee, 18)}), have (${formatUnits(bal, 18)})`
+                )
+            }
+
+            // 2) Sign Permit typed-data (EIP-2612)
+            const permitValue = BigInt(data.permit.message.value)
+            const permitNonce = BigInt(data.permit.message.nonce)
+            const deadline = BigInt(data.permit.message.deadline)
+            const signature = await walletClient.signTypedData({
+                account: address,
+                domain: {
+                    name: data.permit.domain.name,
+                    version: data.permit.domain.version ?? '1',
+                    chainId: srcChainId,
+                    verifyingContract: data.permit.domain.verifying_contract,
+                },
+                types: {
+                    Permit: [
+                        { name: 'owner', type: 'address' },
+                        { name: 'spender', type: 'address' },
+                        { name: 'value', type: 'uint256' },
+                        { name: 'nonce', type: 'uint256' },
+                        { name: 'deadline', type: 'uint256' },
+                    ],
+                },
+                primaryType: 'Permit',
+                message: {
+                    owner: address,
+                    spender: data.permit.message.spender,
+                    value: permitValue,
+                    nonce: permitNonce,
+                    deadline,
+                },
+            })
+            console.log('signature', signature)
+
+            const { v, r, s } = splitEcdsaSignature(signature)
+
+            // Keep sendParam consistent with backend amountLD (avoid decimals mismatch)
+            const sendParamSigned = {
+                dstEid: Number(data.resolved.send_param.dst_eid),
+                to: addressToBytes32(recipient) as Hex,
+                amountLD: BigInt(data.resolved.send_param.amount_ld),
+                minAmountLD: BigInt(data.resolved.send_param.min_amount_ld),
+                extraOptions: data.resolved.send_param.extra_options as Hex,
+                composeMsg: data.resolved.send_param.compose_msg as Hex,
+                oftCmd: data.resolved.send_param.oft_cmd as Hex,
+            } as const
+
+            // 3) Call adapter.sendWithPermit in a single on-chain tx
+            const txHash = await writeContractAsync({
+                abi: usdtOftAdapterAbi,
+                address: srcAdapter,
+                functionName: 'sendWithPermit',
+                args: [
+                    sendParamSigned,
+                    fee,
+                    address,
+                    { value: permitValue, deadline, v, r, s },
+                ],
+                value: fee.nativeFee,
+                chainId: srcChainId,
+            })
+
+            setLastSignedTxHash(txHash)
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            setLastSignError(msg)
+        }
     }
 
     const canPayNativeFee = useMemo(() => {
-        if (nativeFee == null) return false
+        if (nativeFee == null) return true // unknown/not quoted yet
         const bal = gateNativeBal?.value
         if (bal == null) return true // unknown; let wallet decide
         // Need msg.value + gas, so require strictly more than nativeFee
         return bal > nativeFee
     }, [gateNativeBal?.value, nativeFee])
 
-    return (
+  return (
         <div style={{ maxWidth: 920, margin: '0 auto', padding: 24, textAlign: 'left' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
                 <div>
-                    <h2 style={{ margin: 0 }}>USDT OFT-Adapter Cross-chain (GateLayer → Sepolia)</h2>
+                    <h2 style={{ margin: 0 }}>OFT-Adapter Cross-chain</h2>
                     <div style={{ opacity: 0.7, marginTop: 6 }}>
-                        Source: {CHAINS.gate.name} (EID {EID.GATE_V2_TESTNET}) → Destination: {CHAINS.sepolia.name} (EID{' '}
-                        {EID.SEPOLIA_V2_TESTNET})
+                        Source: {getChainMeta(srcChainKey).name} (EID {srcEid}) → Destination: {getChainMeta(dstChainKey).name} (EID{' '}
+                        {dstEid}) — Token: {tokenKey}
                     </div>
                 </div>
                 <ConnectButton />
             </div>
 
             <div className="card" style={{ marginTop: 16 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+                    <label>
+                        Source chain
+                        <select
+                            style={{ width: '100%', marginTop: 6, padding: 10 }}
+                            value={srcChainKey}
+                            onChange={(e) => setSrcChainKey(e.target.value as RegistryChainKey)}
+                        >
+                            {chainOptions.map((k) => (
+                                <option key={k} value={k}>
+                                    {getChainMeta(k).name}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label>
+                        Destination chain
+                        <select
+                            style={{ width: '100%', marginTop: 6, padding: 10 }}
+                            value={dstChainKey}
+                            onChange={(e) => setDstChainKey(e.target.value as RegistryChainKey)}
+                        >
+                            {chainOptions.map((k) => (
+                                <option key={k} value={k}>
+                                    {getChainMeta(k).name}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label>
+                        Token
+                        <select
+                            style={{ width: '100%', marginTop: 6, padding: 10 }}
+                            value={tokenKey}
+                            onChange={(e) => setTokenKey(e.target.value as RegistryTokenKey)}
+                        >
+                            {tokenOptions.map((k) => (
+                                <option key={k} value={k}>
+                                    {k}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                </div>
+            </div>
+
+            <div className="card" style={{ marginTop: 16 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
                     <div>
-                        <div style={{ fontWeight: 600 }}>Source (GateLayer)</div>
+                        <div style={{ fontWeight: 600 }}>Source</div>
                         <div style={{ marginTop: 6 }}>
-                            - USDTMock: <code>{gateUsdt}</code>
+                            - Token: <code>{srcToken}</code>
                         </div>
                         <div>
-                            - Adapter: <code>{gateAdapter}</code>
+                            - Adapter: <code>{srcAdapter}</code>
                         </div>
                         <div style={{ marginTop: 8 }}>
-                            - Your balance: <b>{gateBalance != null ? formatUnits(gateBalance, TOKEN_DECIMALS) : '-'}</b> USDT
-                        </div>
-                        <div>
-                            - Allowance to Adapter:{' '}
-                            <b>{gateAllowance != null ? formatUnits(gateAllowance, TOKEN_DECIMALS) : '-'}</b> USDT
+                            - Your balance: <b>{gateBalance != null ? formatUnits(gateBalance, tokenDecimals) : '-'}</b> {tokenKey}
                         </div>
                     </div>
 
                     <div>
-                        <div style={{ fontWeight: 600 }}>Destination (Sepolia)</div>
+                        <div style={{ fontWeight: 600 }}>Destination</div>
                         <div style={{ marginTop: 6 }}>
-                            - USDTMock: <code>{sepoliaUsdt}</code>
+                            - Token: <code>{dstToken}</code>
                         </div>
                         <div>
-                            - Adapter: <code>{sepoliaAdapter}</code>
+                            - Adapter: <code>{dstAdapter}</code>
                         </div>
                         <div style={{ marginTop: 8 }}>
                             - Recipient balance:{' '}
-                            <b>{sepoliaRecipientBal != null ? formatUnits(sepoliaRecipientBal, TOKEN_DECIMALS) : '-'}</b> USDT
+                            <b>{sepoliaRecipientBal != null ? formatUnits(sepoliaRecipientBal, tokenDecimals) : '-'}</b> {tokenKey}
                         </div>
-                        <div>
+      <div>
                             - Adapter liquidity:{' '}
-                            <b>{sepoliaAdapterBal != null ? formatUnits(sepoliaAdapterBal, TOKEN_DECIMALS) : '-'}</b> USDT
+                            <b>{sepoliaAdapterBal != null ? formatUnits(sepoliaAdapterBal, tokenDecimals) : '-'}</b> {tokenKey}
                         </div>
                         {!hasDestLiquidity && (
                             <div style={{ marginTop: 8, color: '#ff6b6b' }}>
@@ -236,49 +423,44 @@ function App() {
                         />
                     </label>
                     <label>
-                        Amount (USDT, 6 decimals)
+                        Amount ({tokenKey}, {tokenDecimals} decimals)
                         <input
                             style={{ width: '100%', marginTop: 6, padding: 10 }}
                             value={amountHuman}
                             onChange={(e) => setAmountHuman(e.target.value)}
                         />
                     </label>
-                </div>
+      </div>
 
                 <div style={{ marginTop: 14, display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                    <button disabled={!address || !amountLD} onClick={onApprove}>
-                        1) Approve
-                    </button>
-                    <button disabled={!address || !sendParam} onClick={onQuote}>
-                        2) Quote fee
-                    </button>
-                    <button disabled={!address || !sendParam || nativeFee == null || !canPayNativeFee} onClick={onSend}>
-                        3) Send (pay nativeFee)
+                    <button disabled={!address || !sendParam || !amountLD || !canPayNativeFee} onClick={onSendWithPermit}>
+                        Send with Permit (quote + sign + send)
                     </button>
                 </div>
 
                 <div style={{ marginTop: 10, opacity: 0.8 }}>
                     - Native fee:{' '}
-                    <b>{nativeFee != null ? `${formatUnits(nativeFee, 18)} ${CHAINS.gate.nativeCurrency.symbol}` : '-'}</b>
+                    <b>{nativeFee != null ? `${formatUnits(nativeFee, 18)} ${getChainMeta(srcChainKey).nativeCurrency.symbol}` : '-'}</b>
                 </div>
                 <div style={{ marginTop: 6, opacity: 0.8 }}>
-                    - Your {CHAINS.gate.nativeCurrency.symbol} balance:{' '}
+                    - Your {getChainMeta(srcChainKey).nativeCurrency.symbol} balance:{' '}
                     <b>{gateNativeBal ? `${gateNativeBal.formatted} ${gateNativeBal.symbol}` : '-'}</b>
                 </div>
                 {!canPayNativeFee && nativeFee != null && (
                     <div style={{ marginTop: 10, color: '#ff6b6b' }}>
-                        Insufficient {CHAINS.gate.nativeCurrency.symbol} to pay <b>nativeFee</b> + gas on GateLayer. You need some
-                        GateLayer testnet native token in your wallet.
+                        Insufficient {getChainMeta(srcChainKey).nativeCurrency.symbol} to pay <b>nativeFee</b> + gas on source chain.
                     </div>
                 )}
 
-                {lastSrcTx && (
+                {lastSignedTxHash && (
                     <div style={{ marginTop: 10 }}>
-                        - Source tx: <code>{lastSrcTx}</code> ({' '}
-                        <a href={EXPLORER.layerzeroTx(lastSrcTx)} target="_blank" rel="noreferrer">
-                            LayerZeroScan
-                        </a>{' '}
-                        )
+                        - Source tx hash: <code>{lastSignedTxHash}</code>
+                    </div>
+                )}
+
+                {lastSignError && (
+                    <div style={{ marginTop: 10, color: '#ff6b6b' }}>
+                        Sign error: <code>{lastSignError}</code>
                     </div>
                 )}
             </div>
@@ -287,8 +469,8 @@ function App() {
                 Env config is in <code>src/constants/layerzero.ts</code> (uses Vite env vars like <code>VITE_GATE_RPC_URL</code>,{' '}
                 <code>VITE_WALLETCONNECT_PROJECT_ID</code>, etc.). See <code>README.md</code> in this folder.
             </div>
-        </div>
-    )
+      </div>
+  )
 }
 
 export default App
