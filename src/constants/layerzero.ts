@@ -29,7 +29,7 @@ export function getRpcUrl(chainKey: RegistryChainKey): string {
 
     // If registry contains a placeholder (e.g. Alchemy "YOUR_KEY"), fall back to viem's default public RPC.
     const fallback =
-        chainKey === 'sepolia' && fromRegistry.includes('REMOVED_SECRET') ? sepolia.rpcUrls.default.http[0] : fromRegistry
+        chainKey === 'sepolia' && fromRegistry.includes('') ? sepolia.rpcUrls.default.http[0] : fromRegistry
 
     return override ?? fallback
 }
